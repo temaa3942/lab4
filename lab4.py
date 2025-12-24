@@ -1,14 +1,19 @@
 import re
 import requests
 import telebot
+from telebot import types
 
-#ТОКЕН ТГ
+# ТОКЕН ТГ
 BOT_TOKEN = "8591210754:AAE5ZpQJzV2fIwmhAWBdMzP3xa8kX9a8AZU"
 # Базовый адрес REST Countries API
 API_BASE = "https://restcountries.com/v3.1"
 
 # Создаем объект Telegram-бота
 bot = telebot.TeleBot(BOT_TOKEN)
+
+LIST_PAGE_SIZE = 20
+_countries_cache = None  # сюда кэшируем список стран 
+
 
 # ФУНКЦИИ ДЛЯ РАБОТЫ С API
 def api_get_json(url: str):
@@ -28,7 +33,7 @@ def api_get_json(url: str):
         return r.json()
     except requests.RequestException:
         return "NETWORK_ERROR"
-    
+
 
 def get_countries_by_name(name: str):
     """
@@ -38,8 +43,105 @@ def get_countries_by_name(name: str):
     return api_get_json(f"{API_BASE}/name/{name}")
 
 
-# ФОРМАТИРОВАНИЕ ОТВЕТА
+def get_all_countries_names():
+    """
+    Получение списка всех стран.
+    Нужно translations, чтобы показать русское название рядом с английским.
+    """
+    return api_get_json(f"{API_BASE}/all?fields=name,translations")
 
+
+def _prepare_countries_list(raw_list):
+    """
+    Превращает ответ API в список кортежей (en, ru).
+    ru берется из translations.rus.common, если есть.
+    """
+    out = []
+    if not isinstance(raw_list, list):
+        return out
+
+    for c in raw_list:
+        en = c.get("name", {}).get("common", "—")
+
+        translations = c.get("translations") or {}
+        ru = "—"
+        if isinstance(translations, dict):
+            rus = translations.get("rus") or {}
+            if isinstance(rus, dict):
+                ru = rus.get("common") or rus.get("official") or "—"
+
+        out.append((en, ru))
+
+    # сортировка по английскому
+    out.sort(key=lambda x: (x[0] or "").lower())
+    return out
+
+
+def _build_list_text(page: int, items):
+    total = len(items)
+    if total == 0:
+        return "Список стран пуст."
+
+    pages = (total + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE
+    if page < 0:
+        page = 0
+    if page > pages - 1:
+        page = pages - 1
+
+    start = page * LIST_PAGE_SIZE
+    end = min(start + LIST_PAGE_SIZE, total)
+
+    lines = [f"📄 Список стран (страница {page + 1}/{pages})\n"]
+    for i in range(start, end):
+        en, ru = items[i]
+        lines.append(f"{i + 1}. {en} — {ru}")
+
+    return "\n".join(lines)
+
+
+def _build_list_keyboard(page: int, total_items: int):
+    pages = (total_items + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE
+    kb = types.InlineKeyboardMarkup()
+
+    prev_page = page - 1
+    next_page = page + 1
+
+    btns = []
+    if prev_page >= 0:
+        btns.append(types.InlineKeyboardButton("◀️ Назад", callback_data=f"list:{prev_page}"))
+    if next_page < pages:
+        btns.append(types.InlineKeyboardButton("Вперёд ▶️", callback_data=f"list:{next_page}"))
+
+    if btns:
+        kb.row(*btns)
+    return kb
+
+
+def _send_or_edit_list(chat_id=None, message_id=None, page=0):
+    global _countries_cache
+
+    # грузим кэш один раз
+    if _countries_cache is None:
+        raw = get_all_countries_names()
+        if raw in ("NETWORK_ERROR", "API_ERROR") or raw is None:
+            text = "⚠️ Не удалось получить список стран. Попробуй позже."
+            if message_id:
+                bot.edit_message_text(text, chat_id, message_id)
+            else:
+                bot.send_message(chat_id, text)
+            return
+        _countries_cache = _prepare_countries_list(raw)
+
+    text = _build_list_text(page, _countries_cache)
+    kb = _build_list_keyboard(page, len(_countries_cache))
+
+    if message_id:
+        bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
+    else:
+        bot.send_message(chat_id, text, reply_markup=kb)
+
+
+# ФОРМАТИРОВАНИЕ ОТВЕТА
 def format_country(c: dict) -> str:
     """
     Преобразует JSON-объект страны в удобный текст для сообщения в Telegram.
@@ -84,9 +186,7 @@ def format_country(c: dict) -> str:
     )
 
 
-# =========================
-# ОБРАБОТЧИКИ КОМАНД TELEGRAM
-# =========================
+# ОБРАБОТЧИКИ КОМАНД
 @bot.message_handler(commands=["start"])
 def start(message):
     """
@@ -98,6 +198,7 @@ def start(message):
         "Я бот со справочной информацией по странам (REST Countries API).\n\n"
         "Команды:\n"
         "/country <страна> — информация о стране\n"
+        "/list — список стран \n"
         "/help — помощь"
     )
 
@@ -110,10 +211,8 @@ def help_cmd(message):
     bot.send_message(
         message.chat.id,
         "📌 Команды:\n"
-        "/country <страна>\n\n"
-        "Примеры:\n"
-        "/country Finland\n"
-        "/country Japan"
+        "/country <country> - информация о стране \n"
+        "/list  - список стран "
     )
 
 
@@ -152,116 +251,28 @@ def country(message):
     # Выводим информацию по первой найденной стране
     bot.send_message(message.chat.id, format_country(data[0]))
 
-from telebot import types
-
-# =========================
-# /list С КНОПКАМИ
-# =========================
-
-COUNTRIES_CACHE = {}   # chat_id -> list of country names
-PAGE_SIZE = 20         # сколько стран на странице
-
-
-def build_list_keyboard(page: int, total_pages: int):
-    """
-    Создаёт inline-клавиатуру для листания списка стран
-    """
-    kb = types.InlineKeyboardMarkup()
-    buttons = []
-
-    if page > 0:
-        buttons.append(
-            types.InlineKeyboardButton(
-                text="⬅️ Назад",
-                callback_data=f"list:{page-1}"
-            )
-        )
-
-    if page < total_pages - 1:
-        buttons.append(
-            types.InlineKeyboardButton(
-                text="➡️ Вперёд",
-                callback_data=f"list:{page+1}"
-            )
-        )
-
-    if buttons:
-        kb.row(*buttons)
-
-    return kb
-
 
 @bot.message_handler(commands=["list"])
-def list_countries(message):
+def list_cmd(message):
     """
-    /list — выводит список стран с кнопками навигации
+    /list — выводит список стран (English — Русский) с кнопками листания
     """
-    data = api_get_json(f"{API_BASE}/all")
+    _send_or_edit_list(chat_id=message.chat.id, page=0)
 
-    if data == "NETWORK_ERROR":
-        bot.send_message(message.chat.id, "⚠️ Ошибка сети. Попробуй позже.")
-        return
-    if data == "API_ERROR":
-        bot.send_message(message.chat.id, "⚠️ Ошибка сервиса API. Попробуй позже.")
-        return
-    if not data or not isinstance(data, list):
-        bot.send_message(message.chat.id, "❌ Не удалось получить список стран.")
-        return
-    print("REST Countries status:", data.status_code)
-
-    # Сохраняем список стран в кэше
-    names = [c.get("name", {}).get("common", "—") for c in data]
-    COUNTRIES_CACHE[message.chat.id] = names
-
-    page = 0
-    total_pages = (len(names) + PAGE_SIZE - 1) // PAGE_SIZE
-
-    start = page * PAGE_SIZE
-    end = start + PAGE_SIZE
-    chunk = names[start:end]
-
-    text = (
-        f"🌍 Список стран (страница {page+1}/{total_pages}):\n"
-        + "\n".join(chunk)
-    )
-
-    bot.send_message(
-        message.chat.id,
-        text,
-        reply_markup=build_list_keyboard(page, total_pages)
-    )
-    
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("list:"))
 def list_callback(call):
     """
-    Обработка нажатий кнопок 'Назад / Вперёд'
+    Обработчик кнопок для /list
     """
-    page = int(call.data.split(":")[1])
-    names = COUNTRIES_CACHE.get(call.message.chat.id)
+    try:
+        page = int(call.data.split(":", 1)[1])
+    except Exception:
+        page = 0
 
-    if not names:
-        bot.answer_callback_query(call.id, "Список устарел. Введите /list заново.")
-        return
-
-    total_pages = (len(names) + PAGE_SIZE - 1) // PAGE_SIZE
-    start = page * PAGE_SIZE
-    end = start + PAGE_SIZE
-    chunk = names[start:end]
-
-    text = (
-        f"🌍 Список стран (страница {page+1}/{total_pages}):\n"
-        + "\n".join(chunk)
-    )
-
-    bot.edit_message_text(
-        text=text,
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        reply_markup=build_list_keyboard(page, total_pages)
-    )
-
+    _send_or_edit_list(chat_id=call.message.chat.id, message_id=call.message.message_id, page=page)
     bot.answer_callback_query(call.id)
+
 
 print("Бот запущен...")
 bot.infinity_polling()
